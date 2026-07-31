@@ -136,6 +136,38 @@ gst_droidvec_copy_packed_planes (guint8 * out0, guint8 * out1, gint stride_out,
 
 #define ALIGN_SIZE(size, to) (((size) + to  - 1) & ~(to - 1))
 
+/* The codec reports neither stride nor slice height (droid_media_codec_get_output_info
+ * only carries width/height/format/crop), so the alignment constants used below are a
+ * guess at the gralloc layout. When the frame comes back as a plain buffer, CCodec may
+ * hand over a repacked, unpadded copy instead, and the guess then points the UV plane
+ * past the end of it. Pick whichever layout the buffer size can actually hold. */
+static gboolean
+gst_droidvdec_pick_layout (GstDroidVDec * dec, DroidMediaData * in, gsize width,
+    gsize height, gint h_align, gint v_align, gint * stride, gint * slice_height)
+{
+  gint s = ALIGN_SIZE (width, h_align);
+  gint sh = ALIGN_SIZE (height, v_align);
+
+  if (in->size >= (ssize_t) ((gsize) s * sh * 3 / 2)) {
+    *stride = s;
+    *slice_height = sh;
+    return TRUE;
+  }
+
+  if (in->size >= (ssize_t) (width * height * 3 / 2)) {
+    GST_DEBUG_OBJECT (dec, "buffer is %" G_GSSIZE_FORMAT " bytes, too small for a "
+        "%dx%d padded layout; treating it as tightly packed %" G_GSIZE_FORMAT "x%"
+        G_GSIZE_FORMAT, in->size, s, sh, width, height);
+    *stride = width;
+    *slice_height = height;
+    return TRUE;
+  }
+
+  GST_ERROR_OBJECT (dec, "buffer of %" G_GSSIZE_FORMAT " bytes is too small for a "
+      "%" G_GSIZE_FORMAT "x%" G_GSIZE_FORMAT " I420 frame", in->size, width, height);
+  return FALSE;
+}
+
 static gboolean
 gst_droidvdec_convert_native_to_i420 (GstDroidVDec * dec, GstMapInfo * out,
     DroidMediaData * in, GstVideoInfo * info, gsize width, gsize height)
@@ -233,10 +265,14 @@ gst_droidvdec_convert_yuv420_semi_planar_to_i420 (GstDroidVDec * dec,
     gsize height)
 {
   GST_DEBUG_OBJECT (dec, "Converting from OMX_COLOR_FormatYUV420SemiPlanar");
-  gint stride = width;
-  gint slice_height = ALIGN_SIZE (height, 16);
+  gint stride, slice_height;
   gint top = dec->crop_rect.top;
   gint left = dec->crop_rect.left;
+
+  if (!gst_droidvdec_pick_layout (dec, in, width, height, 1, 16, &stride,
+          &slice_height)) {
+    return FALSE;
+  }
 
   guint8 *y = in->data + (top * stride) + left;
   guint8 *uv = in->data + (stride * slice_height) + (top * stride / 2) + left;
@@ -258,10 +294,14 @@ gst_droidvdec_convert_yuv420_packed_semi_planar_to_i420 (GstDroidVDec * dec,
   /* copy to the output buffer swapping the u and v planes and cropping if necessary */
   /* NV12 format with 128 byte alignment */
   GST_DEBUG_OBJECT (dec, "Converting from qcom NV12 semi planar");
-  gint stride = ALIGN_SIZE (width, 128);
-  gint slice_height = ALIGN_SIZE (height, 32);
+  gint stride, slice_height;
   gint top = ALIGN_SIZE (dec->crop_rect.top, 2);
   gint left = ALIGN_SIZE (dec->crop_rect.left, 2);
+
+  if (!gst_droidvdec_pick_layout (dec, in, width, height, 128, 32, &stride,
+          &slice_height)) {
+    return FALSE;
+  }
 
   guint8 *y = in->data + (top * stride) + left;
   guint8 *uv = in->data + (stride * slice_height) + (top * stride / 2) + left;
