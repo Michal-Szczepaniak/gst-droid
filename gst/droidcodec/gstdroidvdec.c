@@ -545,6 +545,19 @@ gst_droidvdec_frame_available (void *user, DroidMediaBuffer * buffer)
     goto error;
   }
 
+  if (G_UNLIKELY (dec->prerolled && GST_STATE (decoder) == GST_STATE_PAUSED)) {
+    /* See gst_droidvdec_data_available for the rationale. Returning false
+     * here lets droidmedia release the buffer straight back to the codec
+     * without us touching the GL/Wayland pipeline at all. Gated on
+     * dec->prerolled so the first frame after a flush/seek always gets
+     * through to complete preroll. */
+    frame = gst_video_decoder_get_oldest_frame (decoder);
+    if (frame) {
+      gst_video_decoder_release_frame (decoder, frame);
+    }
+    goto error;
+  }
+
   pool = gst_video_decoder_get_buffer_pool (decoder);
 
   if (G_UNLIKELY (!pool)) {
@@ -597,6 +610,8 @@ gst_droidvdec_frame_available (void *user, DroidMediaBuffer * buffer)
      * function has succeeded. */
     gst_buffer_unref (buff);
   } else {
+    dec->prerolled = TRUE;
+
     frame->output_buffer = buff;
 
     /* We get the timestamp in ns already */
@@ -654,6 +669,25 @@ gst_droidvdec_data_available (void *data, DroidMediaCodecData * encoded)
     }
   }
 
+  if (G_UNLIKELY (dec->prerolled && GST_STATE (decoder) == GST_STATE_PAUSED)) {
+    /* While paused nothing is consuming frames downstream and qmlglsink
+     * gives us no backpressure, so the codec keeps draining its backlog
+     * at full speed. Every one of those frames still goes through the
+     * full GL upload path, which floods and starves the Wayland
+     * connection shared with the UI thread and freezes the app for the
+     * duration of the drain. Drop backlog frames instead of pushing
+     * them while paused; playback picks back up from the next frame
+     * decoded after we resume. Gated on dec->prerolled so the very
+     * first frame after a flush/seek always gets through, since the
+     * sink needs at least one buffer to complete preroll. */
+    frame = gst_video_decoder_get_oldest_frame (decoder);
+    if (frame) {
+      gst_video_decoder_release_frame (decoder, frame);
+    }
+    flow_ret = dec->downstream_flow_ret;
+    goto out;
+  }
+
   buff = gst_video_decoder_allocate_output_buffer (decoder);
 
   gst_buffer_add_video_meta (buff, GST_VIDEO_FRAME_FLAG_NONE,
@@ -676,6 +710,8 @@ gst_droidvdec_data_available (void *data, DroidMediaCodecData * encoded)
     flow_ret = dec->downstream_flow_ret;
     goto out;
   }
+
+  dec->prerolled = TRUE;
 
   /* We get the timestamp in ns already */
   frame->pts = encoded->ts;
@@ -1150,6 +1186,7 @@ gst_droidvdec_start (GstVideoDecoder * decoder)
   dec->codec_type = NULL;
   dec->dirty = TRUE;
   dec->running = TRUE;
+  dec->prerolled = FALSE;
   dec->format = GST_VIDEO_FORMAT_UNKNOWN;
   dec->codec_reported_height = -1;
   dec->codec_reported_width = -1;
@@ -1450,6 +1487,7 @@ gst_droidvdec_flush (GstVideoDecoder * decoder)
 
 
   dec->downstream_flow_ret = GST_FLOW_OK;
+  dec->prerolled = FALSE;
   GST_DROIDVDEC_STATE_LOCK (dec);
   if (dec->state != GST_DROID_VDEC_STATE_WAITING_FOR_EOS) {
     dec->dirty = TRUE;

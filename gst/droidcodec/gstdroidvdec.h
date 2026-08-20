@@ -74,6 +74,10 @@ struct _GstDroidVDec
   gboolean dirty;
   DroidMediaRect crop_rect;
   gboolean running;
+  /* TRUE once a frame has been pushed downstream since the last flush.
+   * Used to let preroll (and seeking while paused) always complete
+   * before we start dropping decoder backlog while paused. */
+  gboolean prerolled;
   gboolean use_hardware_buffers;
   GstVideoFormat format;
 
